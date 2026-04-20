@@ -3,13 +3,13 @@
 traffic_violation_gui.py
 ========================
 Smart E-Challan — Traffic Violation Detection System
-Overspeeding Detection with Tkinter GUI
+Dual Detection: Overspeeding + No-Helmet / Wrong-Lane / Triple-Riding
 
 Run:
     python traffic_violation_gui.py
 
 Dependencies (pip install if missing):
-    pip install Pillow opencv-python tensorflow numpy
+    pip install Pillow opencv-python tensorflow numpy roboflow python-decouple requests
 """
 
 # ── Standard library ─────────────────────────────────────────────────────────
@@ -21,6 +21,7 @@ import datetime
 import time
 import tarfile
 import urllib.request
+import logging
 
 # ── Third-party ───────────────────────────────────────────────────────────────
 import numpy as np
@@ -41,9 +42,23 @@ from utils.violation_logger import (
     init_db, log_violation, fetch_all_violations,
     clear_violations, get_violation_count
 )
+from utils.helmet_detector import HelmetDetector
 
 import tensorflow.compat.v1 as tf
 tf.disable_v2_behavior()
+
+# ── Environment config ────────────────────────────────────────────────────────
+try:
+    from decouple import config as env_config
+    ROBOFLOW_API_KEY = env_config("ROBOFLOW_API_KEY", default="")
+    OCR_SPACE_API    = env_config("OCR_SPACE_API",    default="")
+except ImportError:
+    ROBOFLOW_API_KEY = ""
+    OCR_SPACE_API    = ""
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(name)s  %(message)s")
+_log = logging.getLogger("traffic_gui")
 
 # ── Model paths ───────────────────────────────────────────────────────────────
 MODEL_NAME   = "ssd_mobilenet_v1_coco_11_06_2017"
@@ -70,6 +85,8 @@ C_RED      = "#da3633"          # violation / danger
 C_TEXT     = "#f0f6fc"
 C_MUTED    = "#8b949e"
 C_CYAN     = "#58a6ff"
+C_ORANGE   = "#f0883e"          # helmet violations
+C_PURPLE   = "#a371f7"          # wrong lane / triple riding
 
 FONT_TITLE  = ("Segoe UI", 13, "bold")
 FONT_BODY   = ("Segoe UI", 10)
@@ -77,15 +94,23 @@ FONT_BOLD   = ("Segoe UI", 10, "bold")
 FONT_STAT   = ("Segoe UI", 22, "bold")
 FONT_SMALL  = ("Segoe UI", 9)
 
+# ── Violation type display config ─────────────────────────────────────────────
+VIO_DISPLAY = {
+    "overspeeding":   ("⚡ Overspeed",  C_RED),
+    "no_helmet":      ("🪖 No Helmet",  C_ORANGE),
+    "wrong_lane":     ("🛣 Wrong Lane", C_PURPLE),
+    "triple_riding":  ("👥 Triple",     C_PURPLE),
+}
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 class TrafficViolationApp:
-    """Main application window."""
+    """Main application window — dual detection: overspeeding + helmet."""
 
     # ── Construction ─────────────────────────────────────────────────────────
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("Smart E-Challan  ·  Traffic Violation Detection")
+        self.root.title("Smart E-Challan  ·  Traffic Violation Detection  (Overspeeding + Helmet)")
         self.root.configure(bg=C_BG)
         self.root.state("zoomed")          # maximise on Windows
         self.root.minsize(1100, 650)
@@ -108,13 +133,26 @@ class TrafficViolationApp:
         self._vio_cooldown: dict[int, float] = {}
         self._COOLDOWN_S = 6.0             # seconds between consecutive logs per vehicle
 
+        # ── Helmet detection state ────────────────────────────────────────
+        self.helmet_enabled   = bool(ROBOFLOW_API_KEY)
+        self._helmet_detector = None       # pre-loaded before detection starts
+        self._helmet_thread   = None
+        self._helmet_frame_q  = queue.Queue(maxsize=1)   # latest frame for helmet thread
+        self._helmet_cooldown = 0.0        # last helmet scan timestamp
+        self._HELMET_INTERVAL = 2.0        # seconds between helmet scans
+        self._models_loaded   = threading.Event()         # set when Roboflow models are ready
+
         # Tkinter observable vars
-        self._var_speed_limit  = tk.StringVar(value="—")
-        self._var_violations   = tk.IntVar(value=0)
-        self._var_fps          = tk.StringVar(value="—")
-        self._var_avg_speed    = tk.StringVar(value="—")
-        self._var_status       = tk.StringVar(value="⬤  Idle")
-        self._var_video_name   = tk.StringVar(value="No video selected")
+        self._var_speed_limit   = tk.StringVar(value="—")
+        self._var_violations    = tk.IntVar(value=0)
+        self._var_helmet_vio    = tk.IntVar(value=0)
+        self._var_fps           = tk.StringVar(value="—")
+        self._var_avg_speed     = tk.StringVar(value="—")
+        self._var_status        = tk.StringVar(value="⬤  Idle")
+        self._var_video_name    = tk.StringVar(value="No video selected")
+        self._var_helmet_status = tk.StringVar(
+            value="🪖 ON" if self.helmet_enabled else "🪖 OFF"
+        )
 
         # ── Init persistent storage ───────────────────────────────────────
         init_db()
@@ -159,11 +197,14 @@ class TrafficViolationApp:
         hdr.pack(fill="x", side="top")
         hdr.pack_propagate(False)
 
-        tk.Label(hdr, text="🚦  Smart E-Challan  ·  Traffic Violation Detection",
+        tk.Label(hdr, text="🚦  Smart E-Challan  ·  Overspeeding + Helmet Detection",
                  bg=C_CARD, fg=C_TEXT, font=FONT_TITLE).pack(side="left", padx=18, pady=12)
 
         tk.Label(hdr, textvariable=self._var_status,
                  bg=C_CARD, fg=C_WARN, font=FONT_BOLD).pack(side="right", padx=18)
+
+        tk.Label(hdr, textvariable=self._var_helmet_status,
+                 bg=C_CARD, fg=C_ORANGE, font=FONT_BOLD).pack(side="right", padx=6)
 
         tk.Label(hdr, textvariable=self._var_video_name,
                  bg=C_CARD, fg=C_MUTED, font=FONT_SMALL).pack(side="right", padx=6)
@@ -190,6 +231,7 @@ class TrafficViolationApp:
 
         self._build_stat_cards(right)
         self._build_log_panel(right)
+        self._build_helmet_log_panel(right)
         self._build_snapshot_panel(right)
 
         # ── Toolbar ───────────────────────────────────────────────────────
@@ -201,12 +243,14 @@ class TrafficViolationApp:
         grid.pack(fill="x", pady=(0, 6))
         grid.columnconfigure(0, weight=1)
         grid.columnconfigure(1, weight=1)
+        grid.columnconfigure(2, weight=1)
 
         stats = [
-            ("Speed Limit",  self._var_speed_limit, "km/h", C_CYAN, 0, 0),
-            ("Violations ⚠",  self._var_violations,  "",     C_RED,  0, 1),
-            ("Current FPS",  self._var_fps,          "",     C_TEXT, 1, 0),
-            ("Avg Speed",    self._var_avg_speed,    "km/h", C_TEXT, 1, 1),
+            ("Speed Limit",     self._var_speed_limit,  "km/h", C_CYAN,   0, 0),
+            ("⚡ Overspeed",    self._var_violations,   "",     C_RED,    0, 1),
+            ("🪖 Helmet Vio",   self._var_helmet_vio,   "",     C_ORANGE, 0, 2),
+            ("Current FPS",     self._var_fps,          "",     C_TEXT,   1, 0),
+            ("Avg Speed",       self._var_avg_speed,    "km/h", C_TEXT,   1, 1),
         ]
         for label, var, unit, fg, row, col in stats:
             card = tk.Frame(grid, bg=C_CARD, padx=10, pady=8)
@@ -225,7 +269,7 @@ class TrafficViolationApp:
 
         hdr = tk.Frame(frm, bg=C_CARD)
         hdr.pack(fill="x", padx=8, pady=(8, 3))
-        tk.Label(hdr, text="📋  Violation Log",
+        tk.Label(hdr, text="📋  Violation Log  (All Types)",
                  bg=C_CARD, fg=C_TEXT, font=FONT_BOLD).pack(side="left")
 
         clear_btn = tk.Button(hdr, text="Clear All", bg=C_RED, fg="white",
@@ -233,14 +277,15 @@ class TrafficViolationApp:
                               cursor="hand2", command=self._clear_log)
         clear_btn.pack(side="right")
 
-        cols = ("ID", "Timestamp", "Vehicle", "Speed", "Limit")
+        cols = ("ID", "Timestamp", "Type", "Vehicle", "Speed", "Plate")
         self.tree = ttk.Treeview(frm, columns=cols, show="headings", height=9)
         for col, w, anc in [
             ("ID",        34,  "center"),
-            ("Timestamp", 128, "w"),
-            ("Vehicle",   68,  "center"),
-            ("Speed",     60,  "center"),
-            ("Limit",     54,  "center"),
+            ("Timestamp", 118, "w"),
+            ("Type",      80,  "center"),
+            ("Vehicle",   60,  "center"),
+            ("Speed",     55,  "center"),
+            ("Plate",     75,  "center"),
         ]:
             self.tree.heading(col, text=col)
             self.tree.column(col, width=w, anchor=anc, stretch=False)
@@ -252,8 +297,70 @@ class TrafficViolationApp:
 
         self.tree.bind("<<TreeviewSelect>>", self._on_log_row_click)
 
-        # tag for violation rows
-        self.tree.tag_configure("vio", foreground=C_RED)
+        # tags for violation types
+        self.tree.tag_configure("overspeeding",  foreground=C_RED)
+        self.tree.tag_configure("no_helmet",     foreground=C_ORANGE)
+        self.tree.tag_configure("wrong_lane",    foreground=C_PURPLE)
+        self.tree.tag_configure("triple_riding", foreground=C_PURPLE)
+
+    # ── Helmet Activity Log panel ──────────────────────────────────────────────
+    def _build_helmet_log_panel(self, parent):
+        frm = tk.Frame(parent, bg=C_CARD)
+        frm.pack(fill="x", pady=(0, 6))
+
+        hdr = tk.Frame(frm, bg=C_CARD)
+        hdr.pack(fill="x", padx=8, pady=(8, 3))
+        tk.Label(hdr, text="🪖  Helmet Detection Activity",
+                 bg=C_CARD, fg=C_TEXT, font=FONT_BOLD).pack(side="left")
+
+        clear_hlog_btn = tk.Button(hdr, text="Clear", bg=C_CARD2, fg=C_MUTED,
+                                   font=FONT_SMALL, relief="flat", padx=5, pady=1,
+                                   cursor="hand2", command=self._clear_helmet_log)
+        clear_hlog_btn.pack(side="right")
+
+        self._helmet_log_text = tk.Text(
+            frm, bg="#0a0e14", fg=C_MUTED, font=("Consolas", 8),
+            height=7, wrap="word", relief="flat", padx=6, pady=4,
+            insertbackground=C_MUTED, selectbackground=C_ACCENT,
+            borderwidth=0, highlightthickness=1,
+            highlightbackground=C_BORDER, highlightcolor=C_ACCENT,
+            state="disabled",  # read-only
+        )
+        self._helmet_log_text.pack(fill="x", padx=8, pady=(0, 8))
+
+        # Configure text tags for colored log entries
+        self._helmet_log_text.tag_configure("time",    foreground=C_MUTED)
+        self._helmet_log_text.tag_configure("info",    foreground=C_CYAN)
+        self._helmet_log_text.tag_configure("success", foreground=C_GREEN)
+        self._helmet_log_text.tag_configure("warn",    foreground=C_WARN)
+        self._helmet_log_text.tag_configure("error",   foreground=C_RED)
+        self._helmet_log_text.tag_configure("alert",   foreground=C_ORANGE)
+
+        # Seed with initial message
+        self._helmet_log("Helmet detection module initialized", "info")
+        if self.helmet_enabled:
+            self._helmet_log("Roboflow API key found — helmet detection available", "success")
+        else:
+            self._helmet_log("No API key — helmet detection disabled", "warn")
+
+    def _helmet_log(self, message: str, tag: str = "info"):
+        """Append a timestamped message to the helmet activity log (main thread only)."""
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        self._helmet_log_text.config(state="normal")
+        self._helmet_log_text.insert("end", f"[{ts}] ", "time")
+        self._helmet_log_text.insert("end", f"{message}\n", tag)
+        self._helmet_log_text.see("end")   # auto-scroll
+        # Keep max ~200 lines
+        line_count = int(self._helmet_log_text.index("end-1c").split(".")[0])
+        if line_count > 200:
+            self._helmet_log_text.delete("1.0", "50.0")
+        self._helmet_log_text.config(state="disabled")
+
+    def _clear_helmet_log(self):
+        self._helmet_log_text.config(state="normal")
+        self._helmet_log_text.delete("1.0", "end")
+        self._helmet_log_text.config(state="disabled")
+        self._helmet_log("Log cleared", "info")
 
     # ── Snapshot preview panel ────────────────────────────────────────────────
     def _build_snapshot_panel(self, parent):
@@ -266,7 +373,7 @@ class TrafficViolationApp:
         self.snap_lbl = tk.Label(frm, bg="#0a0a0a",
                                  text="No snapshot selected",
                                  fg=C_MUTED, font=FONT_SMALL,
-                                 width=48, height=11)
+                                 width=48, height=7)
         self.snap_lbl.pack(padx=8, pady=(0, 8))
 
     # ── Toolbar ───────────────────────────────────────────────────────────────
@@ -289,8 +396,31 @@ class TrafficViolationApp:
         self._pause_btn = btn(bar, "⏸  Pause",           C_CARD,  self._toggle_pause, state="disabled")
         self._stop_btn  = btn(bar, "⏹  Stop",            C_RED,   self._stop_detection, state="disabled")
 
+        # Helmet toggle button
+        self._helmet_btn = btn(bar, "🪖 Helmet: ON" if self.helmet_enabled else "🪖 Helmet: OFF",
+                               C_ORANGE if self.helmet_enabled else C_CARD,
+                               self._toggle_helmet)
+
         btn(bar, "📁  Violations Folder", C_CARD, self._open_violations_folder, side="right", pad_l=4)
         btn(bar, "🔄  Refresh Log",       C_CARD, self._refresh_log,             side="right", pad_l=4)
+
+    # ── Helmet detection toggle ───────────────────────────────────────────────
+    def _toggle_helmet(self):
+        if not ROBOFLOW_API_KEY:
+            messagebox.showwarning(
+                "API Key Missing",
+                "No ROBOFLOW_API_KEY found in .env file.\n"
+                "Please add your Roboflow API key to the .env file in the project root.",
+                parent=self.root,
+            )
+            return
+        self.helmet_enabled = not self.helmet_enabled
+        if self.helmet_enabled:
+            self._helmet_btn.config(text="🪖 Helmet: ON", bg=C_ORANGE)
+            self._var_helmet_status.set("🪖 ON")
+        else:
+            self._helmet_btn.config(text="🪖 Helmet: OFF", bg=C_CARD)
+            self._var_helmet_status.set("🪖 OFF")
 
     # ── Startup speed-limit prompt ────────────────────────────────────────────
     def _startup_ask_speed_limit(self):
@@ -488,16 +618,69 @@ class TrafficViolationApp:
         self.running = True
         self.paused  = False
         self._stop_evt.clear()
+        self._models_loaded.clear()
         self._vio_cooldown.clear()
         self._var_violations.set(0)
+        self._var_helmet_vio.set(0)
 
         self._start_btn.config(state="disabled")
-        self._pause_btn.config(state="normal", text="⏸  Pause")
+        self._pause_btn.config(state="disabled", text="⏸  Pause")
         self._stop_btn.config(state="normal")
-        self._set_status("Loading model…", C_WARN)
+        self._set_status("Loading models…", C_WARN)
 
-        t = threading.Thread(target=self._detection_thread, daemon=True)
+        # Start preparation thread — loads ALL models first, then launches detection
+        t = threading.Thread(target=self._preparation_thread, daemon=True)
         t.start()
+
+    # ── Preparation thread — loads models, then starts detection ──────────────
+    def _preparation_thread(self):
+        """Load Roboflow models (if helmet enabled) then start both detection threads."""
+
+        # ── Step 1: Load Roboflow helmet models (if enabled) ──────────────
+        if self.helmet_enabled and ROBOFLOW_API_KEY:
+            self.event_q.put(("status", "Loading Roboflow models…", C_ORANGE))
+            self.event_q.put(("helmet_log", "🔄 Initializing Roboflow models…"))
+            self.event_q.put(("helmet_log", "⏳ Please wait — this may take 15-30 seconds…"))
+
+            self._helmet_detector = HelmetDetector(
+                roboflow_api_key=ROBOFLOW_API_KEY,
+                ocr_api_key=OCR_SPACE_API,
+                status_callback=self._helmet_status_cb,
+            )
+
+            if not self._helmet_detector.is_ready:
+                err = self._helmet_detector.init_error or "Unknown error"
+                self.event_q.put(("helmet_error", f"Helmet model init failed:\n{err}"))
+                self.event_q.put(("helmet_log", f"❌ INIT FAILED: {err}"))
+                _log.error("Helmet detector init failed: %s", err)
+                # Continue without helmet detection
+                self._helmet_detector = None
+                self.helmet_enabled = False
+            else:
+                self.event_q.put(("helmet_log", "🟢 All Roboflow models loaded successfully!"))
+        else:
+            self.event_q.put(("helmet_log", "ℹ Helmet detection disabled — skipping model load"))
+
+        # Signal that models are loaded
+        self._models_loaded.set()
+
+        if not self.running or self._stop_evt.is_set():
+            return
+
+        # ── Step 2: Start both detection threads simultaneously ───────────
+        self.event_q.put(("status", "Starting detection…", C_WARN))
+        self.event_q.put(("helmet_log", "▶ Starting video processing…"))
+
+        # Enable pause button now that we're truly starting
+        self.event_q.put(("enable_pause",))
+
+        # Overspeeding detection thread
+        t1 = threading.Thread(target=self._detection_thread, daemon=True)
+        t1.start()
+
+        # Helmet detection thread
+        if self.helmet_enabled and self._helmet_detector is not None:
+            self._start_helmet_thread()
 
     def _toggle_pause(self):
         if not self.running:
@@ -519,7 +702,9 @@ class TrafficViolationApp:
         self._stop_btn.config(state="disabled")
         self._var_fps.set("—")
 
-    # ── Detection thread ──────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    #  THREAD 1: Overspeeding Detection (TF — local)
+    # ══════════════════════════════════════════════════════════════════════════
     def _detection_thread(self):
         # ── 1. Ensure model exists ─────────────────────────────────────────
         if not os.path.exists(PATH_TO_CKPT):
@@ -606,6 +791,19 @@ class TrafficViolationApp:
                     frame_idx += 1
                     h, w = frame.shape[:2]
 
+                    # ── Feed frame to helmet thread (every HELMET_INTERVAL) ──
+                    now = time.time()
+                    if (self.helmet_enabled
+                            and now - self._helmet_cooldown >= self._HELMET_INTERVAL):
+                        self._helmet_cooldown = now
+                        try:
+                            # Replace any stale frame (non-blocking)
+                            while not self._helmet_frame_q.empty():
+                                self._helmet_frame_q.get_nowait()
+                            self._helmet_frame_q.put_nowait(frame.copy())
+                        except queue.Full:
+                            pass
+
                     # TF inference (every INFER_EVERY frames)
                     if frame_idx % INFER_EVERY == 0:
                         exp = np.expand_dims(frame, axis=0)
@@ -672,20 +870,22 @@ class TrafficViolationApp:
 
                         # VIOLATION
                         if is_vio and vid is not None:
-                            now = time.time()
-                            if now - self._vio_cooldown.get(vid, 0.0) > self._COOLDOWN_S:
-                                self._vio_cooldown[vid] = now
+                            now_ts = time.time()
+                            if now_ts - self._vio_cooldown.get(vid, 0.0) > self._COOLDOWN_S:
+                                self._vio_cooldown[vid] = now_ts
                                 snap = self._save_snapshot(
-                                    frame, L, T, R, B, vid, cls_id, spd)
+                                    frame, L, T, R, B, vid, cls_id, spd,
+                                    vio_type="overspeeding")
                                 ts = log_violation(
                                     vid, cls_name,
                                     round(spd, 1), self.speed_limit_kmh,
                                     snap,
+                                    violation_type="overspeeding",
                                 )
                                 violations_this_frame.append({
                                     "vid": vid, "class": cls_name,
                                     "speed": spd, "snap": snap,
-                                    "ts": ts,
+                                    "ts": ts, "type": "overspeeding",
                                 })
 
                     # ── Draw overlays ──────────────────────────────────────
@@ -710,6 +910,14 @@ class TrafficViolationApp:
                                 (10, 62),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.65,
                                 (0, 200, 255), 2, cv2.LINE_AA)
+
+                    # Helmet status indicator
+                    helmet_txt = "Helmet Detection: ON" if self.helmet_enabled else "Helmet Detection: OFF"
+                    helmet_clr = (60, 220, 130) if self.helmet_enabled else (150, 150, 150)
+                    cv2.putText(frame, helmet_txt,
+                                (10, 92),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                                helmet_clr, 2, cv2.LINE_AA)
 
                     # VIOLATION FLASH banner
                     if violations_this_frame:
@@ -746,10 +954,128 @@ class TrafficViolationApp:
         if not self._stop_evt.is_set():
             self.event_q.put(("done",))
 
-    # ── Snapshot capture ──────────────────────────────────────────────────────
-    def _save_snapshot(self, frame, L, T, R, B, vid, cls_id, speed):
+    # ══════════════════════════════════════════════════════════════════════════
+    #  THREAD 2: Helmet Detection (Roboflow — cloud)
+    # ══════════════════════════════════════════════════════════════════════════
+    def _start_helmet_thread(self):
+        """Launch the helmet detection background thread."""
+        self._helmet_thread = threading.Thread(
+            target=self._helmet_detection_loop, daemon=True
+        )
+        self._helmet_thread.start()
+        _log.info("Helmet detection thread started")
+
+    def _helmet_status_cb(self, message: str):
+        """Called from the helmet detector (background thread) to push status to GUI."""
+        self.event_q.put(("helmet_log", message))
+
+    def _helmet_detection_loop(self):
+        """
+        Runs in a background thread.  Waits for frames from the main detection
+        thread (via _helmet_frame_q), sends them to the Roboflow cloud API,
+        and logs any violations.
+
+        Models are already pre-loaded by _preparation_thread.
+        """
+        if self._helmet_detector is None or not self._helmet_detector.is_ready:
+            self.event_q.put(("helmet_log", "❌ Helmet detector not available"))
+            return
+
+        self.event_q.put(("helmet_log", "🟢 Helmet detector ready — waiting for frames"))
+        _log.info("Helmet detector ready — waiting for frames")
+        scan_count = 0
+
+        while self.running and not self._stop_evt.is_set():
+            try:
+                frame = self._helmet_frame_q.get(timeout=1.0)
+            except queue.Empty:
+                continue
+
+            if not self.helmet_enabled:
+                continue
+
+            scan_count += 1
+            self.event_q.put(("helmet_log", f"━━━ Scan #{scan_count} ━━━━━━━━━━━━━━━━━━"))
+
+            try:
+                results = self._helmet_detector.detect(frame)
+            except Exception as exc:
+                self.event_q.put(("helmet_log", f"❌ Detection failed: {exc}"))
+                _log.error("Helmet detect call failed: %s", exc)
+                continue
+
+            for r in results:
+                vtype = r["violation_type"]
+                bbox = r["bbox"]
+                lp = r.get("license_plate", "")
+
+                # Save snapshot
+                snap_path = self._save_helmet_snapshot(
+                    frame, bbox, vtype, r.get("snapshot_pil"), lp
+                )
+
+                # Log to unified DB
+                ts = log_violation(
+                    vehicle_id=0,
+                    vehicle_class="Motorbike",
+                    speed_kmh=0.0,
+                    speed_limit_kmh=self.speed_limit_kmh,
+                    snapshot_path=snap_path,
+                    violation_type=vtype,
+                    license_plate=lp,
+                )
+
+                display_name = VIO_DISPLAY.get(vtype, (vtype, C_ORANGE))[0]
+                lp_info = f"  Plate: {lp}" if lp else ""
+                self.event_q.put(("helmet_log",
+                    f"🚨 LOGGED: {display_name}{lp_info}  →  DB"))
+
+                # Notify GUI
+                self.event_q.put(("helmet_violation", {
+                    "type": vtype,
+                    "license_plate": lp,
+                    "snap": snap_path,
+                    "ts": ts,
+                }))
+
+        self.event_q.put(("helmet_log", "🔴 Helmet detection thread stopped"))
+        _log.info("Helmet detection thread exiting")
+
+    def _save_helmet_snapshot(
+        self, frame, bbox, vtype, annotated_pil=None, license_plate=""
+    ):
+        """Save a snapshot for a helmet-related violation."""
+        ts_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:19]
+        lp_tag = f"_{license_plate}" if license_plate else ""
+        filename = f"{vtype}{lp_tag}_{ts_str}.jpg"
+        out_path = os.path.join(VIOLATIONS_DIR, filename)
+
+        try:
+            if annotated_pil is not None:
+                annotated_pil.save(out_path)
+            else:
+                x1, y1, x2, y2 = bbox
+                snap = frame.copy()
+                cv2.rectangle(snap,
+                              (max(x1 - 8, 0), max(y1 - 8, 0)),
+                              (min(x2 + 8, snap.shape[1] - 1),
+                               min(y2 + 8, snap.shape[0] - 1)),
+                              (0, 140, 255), 4)
+                vio_label = VIO_DISPLAY.get(vtype, (vtype, C_ORANGE))[0]
+                cv2.putText(snap, vio_label, (x1, max(y1 - 12, 20)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                            (0, 140, 255), 2, cv2.LINE_AA)
+                cv2.imwrite(out_path, snap)
+        except Exception as exc:
+            _log.error("Failed to save helmet snapshot: %s", exc)
+            return ""
+
+        return out_path
+
+    # ── Snapshot capture (overspeeding) ───────────────────────────────────────
+    def _save_snapshot(self, frame, L, T, R, B, vid, cls_id, speed, vio_type="overspeeding"):
         ts_str    = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:19]
-        filename  = f"violation_v{vid}_{ts_str}.jpg"
+        filename  = f"{vio_type}_v{vid}_{ts_str}.jpg"
         out_path  = os.path.join(VIOLATIONS_DIR, filename)
 
         snap = frame.copy()
@@ -783,13 +1109,15 @@ class TrafficViolationApp:
 
     # ── GUI tick (runs every ~33 ms on main thread) ───────────────────────────
     def _gui_tick(self):
-        # Process events from detection thread
+        # Process events from detection threads
         while not self.event_q.empty():
             try:
                 evt = self.event_q.get_nowait()
                 if evt[0] == "status":
                     _, msg, color = evt
                     self._set_status(msg, color)
+                elif evt[0] == "enable_pause":
+                    self._pause_btn.config(state="normal", text="⏸  Pause")
                 elif evt[0] == "done":
                     self.running = False
                     self._start_btn.config(state="normal")
@@ -802,6 +1130,32 @@ class TrafficViolationApp:
                     self._start_btn.config(state="normal")
                     self._pause_btn.config(state="disabled")
                     self._stop_btn.config(state="disabled")
+                elif evt[0] == "helmet_log":
+                    msg = evt[1]
+                    # Determine tag based on message prefix
+                    if "❌" in msg or "FAILED" in msg:
+                        tag = "error"
+                    elif "🚨" in msg or "⚠" in msg or "VIOLATION" in msg:
+                        tag = "alert"
+                    elif "✅" in msg or "🟢" in msg or "ready" in msg.lower():
+                        tag = "success"
+                    elif "📤" in msg or "🔄" in msg or "📦" in msg or "Loading" in msg:
+                        tag = "warn"
+                    else:
+                        tag = "info"
+                    self._helmet_log(msg, tag)
+                elif evt[0] == "helmet_violation":
+                    info = evt[1]
+                    cur = self._var_helmet_vio.get()
+                    self._var_helmet_vio.set(cur + 1)
+                    self._refresh_log()
+                elif evt[0] == "helmet_error":
+                    _log.warning("Helmet error: %s", evt[1])
+                    self._helmet_log(f"❌ {evt[1]}", "error")
+                    # Don't show messagebox — just disable helmet
+                    self.helmet_enabled = False
+                    self._helmet_btn.config(text="🪖 Helmet: ERR", bg=C_RED)
+                    self._var_helmet_status.set("🪖 ERR")
             except queue.Empty:
                 break
 
@@ -840,12 +1194,24 @@ class TrafficViolationApp:
         rows = fetch_all_violations()
         self.tree.delete(*self.tree.get_children())
         for row in rows:
-            vid_id, ts, cls, spd, lim, snap = row
+            # (id, timestamp, vehicle_class, speed_kmh, speed_limit_kmh,
+            #  snapshot_path, violation_type, license_plate)
+            vid_id, ts, cls, spd, lim, snap, vtype, lp = row
+
+            # Human-readable violation type
+            display_type, _ = VIO_DISPLAY.get(vtype, (vtype, C_MUTED))
+
+            # Speed display: show speed for overspeeding, "—" for helmet violations
+            spd_display = f"{spd:.1f}" if vtype == "overspeeding" and spd > 0 else "—"
+
+            # License plate display
+            lp_display = lp if lp else "—"
+
             self.tree.insert(
                 "", "end",
                 iid=str(vid_id),
-                values=(vid_id, ts, cls, f"{spd:.1f}", f"{lim:.0f}"),
-                tags=("vio",),
+                values=(vid_id, ts, display_type, cls, spd_display, lp_display),
+                tags=(vtype,),
             )
 
     def _clear_log(self):
@@ -856,6 +1222,7 @@ class TrafficViolationApp:
         ):
             clear_violations()
             self._var_violations.set(0)
+            self._var_helmet_vio.set(0)
             self.tree.delete(*self.tree.get_children())
             self.snap_lbl.config(image="", text="No snapshot selected", fg=C_MUTED)
 
@@ -867,7 +1234,7 @@ class TrafficViolationApp:
         iid = sel[0]
         for row in fetch_all_violations():
             if str(row[0]) == str(iid):
-                self._show_snapshot(row[5])
+                self._show_snapshot(row[5])  # snapshot_path
                 return
 
     def _show_snapshot(self, path: str):

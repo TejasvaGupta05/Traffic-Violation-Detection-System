@@ -1,0 +1,12 @@
+# Smart E-Challan — Traffic Violation Detection System
+# Core dependencies
+Pillow
+opencv-python
+numpy
+tensorflow
+
+# Helmet detection (Roboflow cloud models + OCR)
+roboflow
+python-decouple
+requests
+tqdm
